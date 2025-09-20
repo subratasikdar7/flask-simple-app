@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  web:
+    image: "${IMAGE_NAME}:${IMAGE_TAG}"
+    container_name: myapp_container
+    ports:
+      - "${PORT}:5000"
+    restart: always

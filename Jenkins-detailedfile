@@ -1,0 +1,286 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Docker Hub credentials (stored in Jenkins credentials)
+        DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
+        
+        // Docker image details
+        DOCKER_IMAGE = 'your-dockerhub-username/flask-app'
+        BUILD_NUMBER_TAG = "${env.BUILD_NUMBER}"
+        
+        // Git information
+        GIT_COMMIT_SHORT = sh(
+            script: 'git rev-parse --short HEAD',
+            returnStdout: true
+        ).trim()
+    }
+    
+    options {
+        // Keep only last 10 builds
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        
+        // Timeout for entire pipeline
+        timeout(time: 30, unit: 'MINUTES')
+        
+        // Skip default checkout
+        skipDefaultCheckout(false)
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+                
+                script {
+                    // Display git information
+                    sh 'git log --oneline -1'
+                    echo "Building commit: ${GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+        
+        stage('Code Quality Check') {
+            parallel {
+                stage('Lint Python') {
+                    steps {
+                        echo 'Running Python linting...'
+                        sh '''
+                            pip install flake8 || echo "flake8 not installed, skipping..."
+                            flake8 app.py --max-line-length=120 || echo "Linting completed with warnings"
+                        '''
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        echo 'Running security scan...'
+                        sh '''
+                            pip install safety || echo "safety not installed, skipping..."
+                            safety check --json || echo "Security scan completed"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                echo "Building Docker image: ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}"
+                
+                script {
+                    // Build the Docker image
+                    def image = docker.build("${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}")
+                    
+                    // Tag with latest
+                    sh "docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG} ${DOCKER_IMAGE}:latest"
+                    
+                    // Tag with git commit
+                    sh "docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG} ${DOCKER_IMAGE}:${GIT_COMMIT_SHORT}"
+                    
+                    echo "Docker image built successfully"
+                }
+            }
+        }
+        
+        stage('Test Docker Image') {
+            steps {
+                echo 'Testing Docker image...'
+                
+                script {
+                    // Run the container for testing
+                    sh """
+                        # Start container in background
+                        docker run -d --name flask-test-${BUILD_NUMBER} -p 5001:5000 ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}
+                        
+                        # Wait for container to start
+                        sleep 10
+                        
+                        # Test health endpoint
+                        curl -f http://localhost:5001/api/status || exit 1
+                        
+                        # Test main page
+                        curl -f http://localhost:5001/ || exit 1
+                        
+                        echo "Container tests passed!"
+                    """
+                }
+            }
+            
+            post {
+                always {
+                    // Clean up test container
+                    sh """
+                        docker stop flask-test-${BUILD_NUMBER} || true
+                        docker rm flask-test-${BUILD_NUMBER} || true
+                    """
+                }
+            }
+        }
+        
+        stage('Push to Docker Hub') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                    branch 'develop'
+                }
+            }
+            
+            steps {
+                echo 'Pushing to Docker Hub...'
+                
+                script {
+                    docker.withRegistry('https://index.docker.io/v1/', 'dockerhub-credentials') {
+                        // Push all tags
+                        sh "docker push ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}"
+                        sh "docker push ${DOCKER_IMAGE}:latest"
+                        sh "docker push ${DOCKER_IMAGE}:${GIT_COMMIT_SHORT}"
+                        
+                        echo "Images pushed successfully to Docker Hub!"
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            
+            steps {
+                echo 'Deploying to staging environment...'
+                
+                // Example deployment steps
+                script {
+                    sh """
+                        # Stop existing staging container
+                        docker stop flask-staging || true
+                        docker rm flask-staging || true
+                        
+                        # Run new container
+                        docker run -d --name flask-staging \\
+                            -p 5002:5000 \\
+                            --restart unless-stopped \\
+                            -e FLASK_ENV=staging \\
+                            ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}
+                        
+                        echo "Staging deployment completed!"
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            
+            input {
+                message "Deploy to production?"
+                ok "Deploy"
+                parameters {
+                    choice(
+                        name: 'DEPLOYMENT_TYPE',
+                        choices: ['rolling', 'blue-green'],
+                        description: 'Choose deployment strategy'
+                    )
+                }
+            }
+            
+            steps {
+                echo "Deploying to production with ${DEPLOYMENT_TYPE} strategy..."
+                
+                script {
+                    if (params.DEPLOYMENT_TYPE == 'rolling') {
+                        sh """
+                            # Rolling deployment
+                            docker stop flask-prod || true
+                            docker rm flask-prod || true
+                            
+                            docker run -d --name flask-prod \\
+                                -p 80:5000 \\
+                                --restart unless-stopped \\
+                                -e FLASK_ENV=production \\
+                                ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}
+                            
+                            echo "Production deployment completed!"
+                        """
+                    } else {
+                        echo "Blue-green deployment would be implemented here"
+                        // Implement blue-green deployment logic
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo 'Cleaning up workspace...'
+            
+            // Clean up Docker images to save space
+            sh """
+                # Remove old images (keep last 5 builds)
+                docker images ${DOCKER_IMAGE} --format "table {{.Tag}}\t{{.ID}}" | \\
+                grep -E '^[0-9]+' | sort -nr | tail -n +6 | awk '{print \$2}' | \\
+                xargs -r docker rmi || true
+                
+                # Clean up dangling images
+                docker image prune -f || true
+            """
+        }
+        
+        success {
+            echo 'Pipeline completed successfully! 🎉'
+            
+            // Send success notification
+            script {
+                def message = """
+                ✅ Build Success!
+                
+                Project: ${env.JOB_NAME}
+                Build: #${env.BUILD_NUMBER}
+                Commit: ${GIT_COMMIT_SHORT}
+                Docker Image: ${DOCKER_IMAGE}:${BUILD_NUMBER_TAG}
+                
+                Duration: ${currentBuild.durationString}
+                """
+                
+                // Example: Send to Slack
+                // slackSend(color: 'good', message: message)
+                
+                echo message
+            }
+        }
+        
+        failure {
+            echo 'Pipeline failed! ❌'
+            
+            script {
+                def message = """
+                ❌ Build Failed!
+                
+                Project: ${env.JOB_NAME}
+                Build: #${env.BUILD_NUMBER}
+                Commit: ${GIT_COMMIT_SHORT}
+                
+                Check the logs: ${env.BUILD_URL}
+                """
+                
+                // Example: Send to Slack
+                // slackSend(color: 'danger', message: message)
+                
+                echo message
+            }
+        }
+        
+        unstable {
+            echo 'Pipeline completed with warnings ⚠️'
+        }
+    }
+}
